@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "central-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--workspace", "apps/web"],
+      "port": 5173
+    },
+    {
+      "name": "central-driver-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "apps/driver", "run", "web"],
+      "port": 8081
+    },
+    {
+      "name": "central-customer-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "apps/customer", "run", "web", "--", "--port", "8082"],
+      "port": 8082
+    }
+  ]
+}

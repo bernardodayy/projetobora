@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-canvas: 246 247 249;
+  --color-surface: 255 255 255;
+  --color-surface-hover: 243 244 246;
+  --color-border: 226 229 233;
+  --color-ink: 22 27 34;
+  --color-muted: 100 109 122;
+  --color-brand: 13 133 122;
+  --color-brand-hover: 10 110 101;
+  --color-brand-ink: 255 255 255;
+  --color-danger: 210 60 60;
+  --color-success: 22 140 94;
+  --color-warning: 191 118 12;
+}
+
+.dark {
+  --color-canvas: 13 16 20;
+  --color-surface: 20 24 30;
+  --color-surface-hover: 27 32 40;
+  --color-border: 39 45 54;
+  --color-ink: 232 235 239;
+  --color-muted: 148 157 168;
+  --color-brand: 25 178 163;
+  --color-brand-hover: 45 198 183;
+  --color-brand-ink: 8 16 15;
+  --color-danger: 235 100 100;
+  --color-success: 60 190 140;
+  --color-warning: 224 158 56;
+}
+
+* {
+  border-color: rgb(var(--color-border));
+}
+
+body {
+  background-color: rgb(var(--color-canvas));
+  color: rgb(var(--color-ink));
+  font-family: 'Inter', system-ui, sans-serif;
+}

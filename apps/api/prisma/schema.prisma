@@ -1,0 +1,644 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────
+// RBAC — usuários administrativos, cargos e permissões
+// ─────────────────────────────────────────────────────────
+
+enum AdminUserStatus {
+  ACTIVE
+  BLOCKED
+}
+
+model AdminUser {
+  id            String          @id @default(uuid())
+  name          String
+  email         String          @unique
+  passwordHash  String
+  roleId        String
+  role          Role            @relation(fields: [roleId], references: [id])
+  status        AdminUserStatus @default(ACTIVE)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  deletedAt     DateTime?
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+  driverBlocks  DriverBlock[]
+
+  @@index([roleId])
+}
+
+model Role {
+  id          String           @id @default(uuid())
+  name        String           @unique
+  description String?
+  isSystem    Boolean          @default(false)
+  permissions RolePermission[]
+  users       AdminUser[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+}
+
+model Permission {
+  id     String           @id @default(uuid())
+  slug   String           @unique
+  module String
+  action String
+  roles  RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  tokenHash String    @unique
+  userId    String
+  user      AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────
+// Auditoria
+// ─────────────────────────────────────────────────────────
+
+// actorId/actor só valem para admin (FK de verdade). Ação de cliente/motorista
+// (cancelar, recusar, avançar a própria corrida) não tem como apontar pra
+// AdminUser — actorType marca quem foi ('admin'/'customer'/'driver') e
+// actorLabel guarda o nome capturado na hora, já que não existe FK pra
+// Customer/Driver aqui (log teria que sobreviver mesmo que o registro
+// original seja removido depois).
+model AuditLog {
+  id         String     @id @default(uuid())
+  actorId    String?
+  actor      AdminUser? @relation(fields: [actorId], references: [id])
+  actorType  String?
+  actorLabel String?
+  action     String
+  entity     String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  createdAt  DateTime   @default(now())
+
+  @@index([entity, entityId])
+  @@index([actorId])
+}
+
+// ─────────────────────────────────────────────────────────
+// Clientes
+// ─────────────────────────────────────────────────────────
+
+enum CustomerStatus {
+  ACTIVE
+  BLOCKED
+}
+
+model Customer {
+  id                String                   @id @default(uuid())
+  name              String
+  cpf               String                   @unique
+  phone             String
+  email             String?                  @unique
+  status            CustomerStatus           @default(ACTIVE)
+  blockedReason     String?
+  rating            Decimal?                 @db.Decimal(3, 2)
+  passwordHash      String?
+  walletBalance     Decimal                  @default(0) @db.Decimal(10, 2)
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  deletedAt         DateTime?
+  addresses         CustomerAddress[]
+  rides             Ride[]
+  refreshTokens     CustomerRefreshToken[]
+  favoriteDrivers   CustomerFavoriteDriver[]
+  blockedDrivers    CustomerBlockedDriver[]
+  blockedByDrivers  DriverBlockedCustomer[]
+  cards             CustomerCard[]
+  walletEntries     WalletTransaction[]
+  couponRedemptions CouponRedemption[]
+
+  @@index([status])
+}
+
+// Sem processamento de pagamento de verdade em lugar nenhum do sistema — o
+// mesmo "rótulo, não cobrança real" já usado em Ride.paymentMethod. Nunca
+// guarda número completo do cartão nem CVV, só o suficiente pra exibir e
+// escolher (bandeira + 4 últimos dígitos, dados que o próprio cliente digita
+// como identificação, não capturados de um cartão real).
+model CustomerCard {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  brand      String
+  last4      String
+  expiry     String
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+}
+
+// Saldo é só um número na tabela Customer — recarga aqui não move dinheiro de
+// verdade (mesma régra dos cartões acima), serve pra exibir extrato e testar
+// pagamento "pela carteira" sem um gateway de pagamento integrado.
+enum WalletTransactionType {
+  TOPUP
+  RIDE_PAYMENT
+  REFUND
+}
+
+model WalletTransaction {
+  id          String                @id @default(uuid())
+  customerId  String
+  customer    Customer              @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  type        WalletTransactionType
+  amount      Decimal               @db.Decimal(10, 2)
+  description String
+  createdAt   DateTime              @default(now())
+
+  @@index([customerId])
+}
+
+model CustomerFavoriteDriver {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  driverId   String
+  driver     Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([customerId, driverId])
+  @@index([customerId])
+}
+
+// Exclusão pro despacho automático (ver RidesService.blockedDriverIds) — não
+// impede atribuição manual pelo admin, só faz o algoritmo nunca oferecer esse
+// motorista de novo pra esse cliente. Mesmo formato de tabela que
+// CustomerFavoriteDriver, sentido oposto.
+model CustomerBlockedDriver {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  driverId   String
+  driver     Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([customerId, driverId])
+  @@index([customerId])
+}
+
+// Mesma ideia do CustomerBlockedDriver, sentido oposto: motorista bloqueando
+// cliente. Tabela própria (não um booleano em Ride) porque a exclusão vale
+// pra qualquer corrida futura desse par, não só a que originou o bloqueio.
+model DriverBlockedCustomer {
+  id         String   @id @default(uuid())
+  driverId   String
+  driver     Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([driverId, customerId])
+  @@index([driverId])
+}
+
+enum CouponDiscountType {
+  PERCENTAGE
+  FIXED
+}
+
+model Coupon {
+  code               String             @id
+  discountType       CouponDiscountType
+  discountValue      Decimal            @db.Decimal(10, 2)
+  maxUses            Int?
+  usesCount          Int                @default(0)
+  maxUsesPerCustomer Int?
+  active             Boolean            @default(true)
+  expiresAt          DateTime?
+  createdAt          DateTime           @default(now())
+  redemptions        CouponRedemption[]
+}
+
+// Um registro por corrida que efetivamente redimiu o cupom — é o que permite
+// checar "esse cliente já usou esse cupom N vezes" sem manter um contador por
+// cliente dentro de Coupon (lista de clientes cresceria sem limite ali).
+model CouponRedemption {
+  id         String   @id @default(uuid())
+  couponCode String
+  coupon     Coupon   @relation(fields: [couponCode], references: [code], onDelete: Cascade)
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  rideId     String   @unique
+  ride       Ride     @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@index([couponCode, customerId])
+}
+
+// Mesmo padrão de refresh rotativo por hash já usado para admin e motorista —
+// tabela própria porque RefreshToken tem FK para AdminUser.
+model CustomerRefreshToken {
+  id         String    @id @default(uuid())
+  tokenHash  String    @unique
+  customerId String
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([customerId])
+}
+
+model CustomerAddress {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  label      String?
+  address    String
+  lat        Decimal  @db.Decimal(9, 6)
+  lng        Decimal  @db.Decimal(9, 6)
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+}
+
+// ─────────────────────────────────────────────────────────
+// Motoristas
+// ─────────────────────────────────────────────────────────
+
+enum DriverStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  BLOCKED
+  SUSPENDED
+}
+
+enum DriverAvailability {
+  OFFLINE
+  AVAILABLE
+  BUSY
+  EN_ROUTE
+  WAITING_PASSENGER
+}
+
+model Driver {
+  id               String                   @id @default(uuid())
+  name             String
+  cpf              String                   @unique
+  phone            String
+  cnh              String
+  cnhCategory      String
+  status           DriverStatus             @default(PENDING)
+  availability     DriverAvailability       @default(OFFLINE)
+  rating           Decimal?                 @db.Decimal(3, 2)
+  lastLat          Decimal?                 @db.Decimal(9, 6)
+  lastLng          Decimal?                 @db.Decimal(9, 6)
+  lastLocationAt   DateTime?
+  // Última vez que o app do motorista deu sinal de vida (ver common/presence.ts).
+  lastSeenAt       DateTime?
+  passwordHash     String?
+  bankInfo         Json?
+  // Pagamento é feito direto ao motorista, fora do app: a chave Pix que o passageiro vê e se ele tem
+  // máquina de cartão no carro (só esses recebem corrida paga no cartão) — ver common/payment.ts.
+  pixKey           String?
+  hasCardMachine   Boolean                  @default(false)
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @updatedAt
+  deletedAt        DateTime?
+  vehicles         Vehicle[]
+  documents        DriverDocument[]
+  rides            Ride[]
+  blocks           DriverBlock[]
+  refreshTokens    DriverRefreshToken[]
+  favoritedBy      CustomerFavoriteDriver[]
+  blockedBy        CustomerBlockedDriver[]
+  blockedCustomers DriverBlockedCustomer[]
+
+  @@index([status])
+  @@index([availability])
+}
+
+// Tabela dedicada (em vez de reaproveitar RefreshToken, que tem FK para
+// AdminUser) para manter o mesmo padrão de refresh rotativo por hash usado
+// no login administrativo, agora para o app do motorista.
+model DriverRefreshToken {
+  id        String    @id @default(uuid())
+  tokenHash String    @unique
+  driverId  String
+  driver    Driver    @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([driverId])
+}
+
+model Vehicle {
+  id        String   @id @default(uuid())
+  driverId  String
+  driver    Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  plate     String   @unique
+  model     String
+  brand     String
+  year      Int?
+  color     String?
+  createdAt DateTime @default(now())
+
+  @@index([driverId])
+}
+
+enum DriverDocumentType {
+  CNH
+  VEHICLE_DOC
+  PROFILE_PHOTO
+  VEHICLE_PHOTO
+  OTHER
+}
+
+model DriverDocument {
+  id        String             @id @default(uuid())
+  driverId  String
+  driver    Driver             @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  type      DriverDocumentType
+  fileUrl   String
+  createdAt DateTime           @default(now())
+
+  @@index([driverId])
+}
+
+model DriverBlock {
+  id          String     @id @default(uuid())
+  driverId    String
+  driver      Driver     @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  reason      String
+  blockedById String?
+  blockedBy   AdminUser? @relation(fields: [blockedById], references: [id])
+  blockedAt   DateTime   @default(now())
+  unblockedAt DateTime?
+
+  @@index([driverId])
+}
+
+// ─────────────────────────────────────────────────────────
+// Corridas
+// ─────────────────────────────────────────────────────────
+
+enum RideStatus {
+  REQUESTED
+  SEARCHING_DRIVER
+  DRIVER_ASSIGNED
+  DRIVER_EN_ROUTE
+  PASSENGER_ABOARD
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CREDIT_CARD
+  DEBIT_CARD
+  PIX
+  WALLET
+}
+
+model Ride {
+  id                    String                 @id @default(uuid())
+  customerId            String
+  customer              Customer               @relation(fields: [customerId], references: [id])
+  driverId              String?
+  driver                Driver?                @relation(fields: [driverId], references: [id])
+  status                RideStatus             @default(REQUESTED)
+  originAddress         String
+  originLat             Decimal                @db.Decimal(9, 6)
+  originLng             Decimal                @db.Decimal(9, 6)
+  destinationAddress    String
+  destinationLat        Decimal                @db.Decimal(9, 6)
+  destinationLng        Decimal                @db.Decimal(9, 6)
+  distanceKm            Decimal?               @db.Decimal(8, 2)
+  durationMin           Decimal?               @db.Decimal(8, 2)
+  baseFare              Decimal?               @db.Decimal(10, 2)
+  distanceFare          Decimal?               @db.Decimal(10, 2)
+  timeFare              Decimal?               @db.Decimal(10, 2)
+  appliedMultiplier     Decimal?               @db.Decimal(6, 3)
+  finalPrice            Decimal?               @db.Decimal(10, 2)
+  pricingBreakdown      Json?
+  customerRating        Int?
+  driverRating          Int?
+  paymentMethod         PaymentMethod?
+  couponCode            String?
+  discountApplied       Decimal?               @db.Decimal(10, 2)
+  scheduledAt           DateTime?
+  // Quando a oferta ao motorista atual vence (só despacho automático; null = atribuição manual, que não expira).
+  offerExpiresAt        DateTime?
+  requestedAt           DateTime               @default(now())
+  completedAt           DateTime?
+  cancelledAt           DateTime?
+  cancelReason          String?
+  events                RideEvent[]
+  messages              RideMessage[]
+  financialTransactions FinancialTransaction[]
+  couponRedemption      CouponRedemption?
+
+  @@index([status])
+  @@index([customerId])
+  @@index([driverId])
+  @@index([requestedAt])
+}
+
+model RideEvent {
+  id        String     @id @default(uuid())
+  rideId    String
+  ride      Ride       @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  status    RideStatus
+  metadata  Json?
+  createdAt DateTime   @default(now())
+
+  @@index([rideId])
+}
+
+// Chat entre motorista e cliente durante a corrida (ver RidesService.sendMessage
+// pro porquê da janela de status) — senderType como string simples, não FK
+// dupla, porque cada corrida só tem um participante de cada lado.
+model RideMessage {
+  id         String   @id @default(uuid())
+  rideId     String
+  ride       Ride     @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  senderType String
+  message    String
+  createdAt  DateTime @default(now())
+
+  @@index([rideId])
+}
+
+// ─────────────────────────────────────────────────────────
+// Precificação
+// ─────────────────────────────────────────────────────────
+
+enum CombinationStrategy {
+  HIGHEST_MULTIPLIER
+  MULTIPLY_ALL
+  ZONE_PRIORITY
+  SCHEDULE_PRIORITY
+  ZONE_FIXED_VALUE
+}
+
+model PricingConfiguration {
+  id                  String                        @id @default(uuid())
+  name                String                        @default("default")
+  baseFare            Decimal                       @db.Decimal(10, 2)
+  perKm               Decimal                       @db.Decimal(10, 2)
+  perMinute           Decimal                       @db.Decimal(10, 2)
+  minimumFare         Decimal                       @db.Decimal(10, 2)
+  combinationStrategy CombinationStrategy           @default(HIGHEST_MULTIPLIER)
+  isActive            Boolean                       @default(true)
+  createdAt           DateTime                      @default(now())
+  updatedAt           DateTime                      @updatedAt
+  history             PricingConfigurationHistory[]
+}
+
+model PricingConfigurationHistory {
+  id            String               @id @default(uuid())
+  configId      String
+  config        PricingConfiguration @relation(fields: [configId], references: [id], onDelete: Cascade)
+  field         String
+  previousValue String
+  newValue      String
+  changedById   String?
+  changedAt     DateTime             @default(now())
+
+  @@index([configId])
+}
+
+enum ZoneShape {
+  POLYGON
+  CIRCLE
+}
+
+model PricingZone {
+  id          String    @id @default(uuid())
+  name        String
+  shape       ZoneShape
+  geometry    Json
+  multiplier  Decimal?  @db.Decimal(6, 3)
+  fixedPrice  Decimal?  @db.Decimal(10, 2)
+  minimumFare Decimal?  @db.Decimal(10, 2)
+  perKm       Decimal?  @db.Decimal(10, 2)
+  perMinute   Decimal?  @db.Decimal(10, 2)
+  baseFare    Decimal?  @db.Decimal(10, 2)
+  priority    Int       @default(0)
+  daysOfWeek  Int[]
+  startTime   String?
+  endTime     String?
+  startDate   DateTime?
+  endDate     DateTime?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([isActive])
+}
+
+model PricingSchedule {
+  id         String   @id @default(uuid())
+  name       String
+  startTime  String
+  endTime    String
+  multiplier Decimal  @db.Decimal(6, 3)
+  daysOfWeek Int[]
+  priority   Int      @default(0)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([isActive])
+}
+
+// ─────────────────────────────────────────────────────────
+// Financeiro
+// ─────────────────────────────────────────────────────────
+
+enum TransactionType {
+  RIDE_PAYMENT
+  DRIVER_PAYOUT
+  PLATFORM_FEE
+  REFUND
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+model FinancialTransaction {
+  id        String            @id @default(uuid())
+  rideId    String?
+  ride      Ride?             @relation(fields: [rideId], references: [id])
+  type      TransactionType
+  status    TransactionStatus @default(PENDING)
+  amount    Decimal           @db.Decimal(10, 2)
+  metadata  Json?
+  createdAt DateTime          @default(now())
+
+  @@index([rideId])
+  @@index([type, status])
+}
+
+// ─────────────────────────────────────────────────────────
+// Notificações & configuração do sistema
+// ─────────────────────────────────────────────────────────
+
+enum NotificationChannel {
+  PUSH
+  EMAIL
+  SMS
+  INTERNAL
+}
+
+model Notification {
+  id         String              @id @default(uuid())
+  channel    NotificationChannel
+  title      String
+  message    String
+  targetType String
+  targetId   String?
+  // Quem originou a notificação (cliente/motorista mandando "Fale conosco"),
+  // separado de targetType/targetId (pra quem ela vai, sempre 'admin' nesses
+  // casos) — precisa pra saber pra quem mandar a resposta de volta.
+  sourceType String?
+  sourceId   String?
+  reply      String?
+  repliedAt  DateTime?
+  readAt     DateTime?
+  createdAt  DateTime            @default(now())
+
+  @@index([targetType, targetId])
+  @@index([sourceType, sourceId])
+}
+
+model SystemConfiguration {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  value     Json
+  updatedAt DateTime @updatedAt
+}
