@@ -1,6 +1,11 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # postgis/postgis empacota o Postgres 16 já com a extensão PostGIS (ver migration
+    # enable_postgis, apps/api). Não existe variante -alpine oficial desta imagem, por isso Debian aqui
+    # (diferente do postgres:16-alpine que ela substitui). Em Docker o usuário do banco já é superusuário
+    # do container, então a migration cria a extensão sozinha — só em bancos gerenciados (RDS, Supabase
+    # etc.) alguém com mais acesso precisa rodar `CREATE EXTENSION postgis;` uma vez antes.
+    image: postgis/postgis:16-3.4
     restart: unless-stopped
     environment:
       POSTGRES_USER: central

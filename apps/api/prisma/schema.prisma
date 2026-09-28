@@ -313,6 +313,10 @@ model Driver {
   lastLat          Decimal?                 @db.Decimal(9, 6)
   lastLng          Decimal?                 @db.Decimal(9, 6)
   lastLocationAt   DateTime?
+  // Espelha lastLat/lastLng, mantido por trigger no banco (ver migration enable_postgis) — a aplicação
+  // nunca escreve aqui direto. Unsupported: some do resultado padrão do Prisma Client, só acessível via
+  // $queryRaw (ver common/postgis.ts).
+  geom             Unsupported("geography(Point, 4326)")?
   // Última vez que o app do motorista deu sinal de vida (ver common/presence.ts).
   lastSeenAt       DateTime?
   passwordHash     String?
@@ -539,6 +543,9 @@ model PricingZone {
   name        String
   shape       ZoneShape
   geometry    Json
+  // Espelha geometry/shape, mantido por trigger no banco (ver migration enable_postgis) — círculo vira
+  // polígono via buffer. Mesma observação do Driver.geom acima: só acessível via $queryRaw.
+  geom        Unsupported("geometry(Geometry, 4326)")?
   multiplier  Decimal?  @db.Decimal(6, 3)
   fixedPrice  Decimal?  @db.Decimal(10, 2)
   minimumFare Decimal?  @db.Decimal(10, 2)

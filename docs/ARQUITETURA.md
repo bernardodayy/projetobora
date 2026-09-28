@@ -833,16 +833,71 @@ vivo. Bugs encontrados e corrigidos — o porquê de cada regra abaixo:
   aberto e online), sem GPS com a tela apagada (o app mantém a tela ligada
   enquanto online), carteira/cartão/pagamento sem gateway real.
 
+## 5-K. PostGIS (preparado, não ligado no despacho/precificação de verdade)
+
+- **O quê**: a extensão PostGIS está habilitada no banco (migration
+  `enable_postgis`) e duas colunas geoespaciais indexadas (GiST) existem e são
+  mantidas **por trigger no Postgres**, não pela aplicação: `Driver.geom`
+  (`geography(Point,4326)`, espelha `lastLat`/`lastLng`) e
+  `PricingZone.geom` (`geometry(Geometry,4326)`, espelha `geometry`/`shape` —
+  círculo vira polígono via `ST_Buffer`). Como os triggers disparam em
+  `BEFORE INSERT OR UPDATE` dessas colunas, **nenhum código da aplicação foi
+  tocado**: heartbeat, atualização de GPS pelo app, correção manual pelo
+  admin, cadastro/edição de zona — tudo continua gravando exatamente como
+  antes e o `geom` se atualiza sozinho. No `schema.prisma` os campos são
+  `Unsupported(...)`, então o Prisma Client nem inclui `geom` nas consultas
+  normais (`findMany`, `select` sem pedir explicitamente) — só dá pra ler via
+  `$queryRaw`, e só quem for buscar de propósito é afetado.
+- **Por que não está ligado no despacho/precificação por padrão**: o casamento
+  em memória (`RidesService.findNearestAvailableDriver`, haversine) e o
+  point-in-polygon em JS (`PricingEngineService.findApplicableZone`) já são
+  testados extensivamente (200+ casos) e funcionam bem no volume atual — a
+  seção 6 já dizia que isso "não é necessário na Fase 1-4". Trocar o caminho
+  ativo do despacho exigiria reescrever essa bateria de testes (eles mockam
+  `prisma.driver.findMany` diretamente) por pouco ganho agora. Em vez disso,
+  ficou pronto e testado, para trocar quando o volume justificar.
+- **`apps/api/src/common/postgis.ts`** tem as duas consultas prontas,
+  equivalentes ponto a ponto ao que roda hoje (mesmos critérios: aprovado,
+  disponível, sinal de vida recente — `presenceCutoff()` —, capaz de receber a
+  forma de pagamento — mesma regra de `common/payment.ts`, duplicada em SQL de
+  propósito —, prefere o raio preferencial e só cai pro raio máximo se
+  ninguém estiver dentro dele):
+  - `nearestDriverPostgis(prisma, origin, options)` — substituiria
+    `RidesService.findNearestAvailableDriver`: uma consulta indexada
+    (`ST_DWithin` + operador KNN `<->`) no lugar de trazer todo mundo pra
+    memória e calcular haversine em JS.
+  - `zonesContainingPoint(prisma, zoneIds, point)` — substituiria o
+    `isPointInPolygon`/`isPointInCircle` dentro de `findApplicableZone`
+    (`ST_Contains`), recebendo só os ids já filtrados por data/dia/horário
+    (isso continua em JS, não é espacial).
+  - Testado com dados reais (`test/postgis.spec.ts` + comparação ao vivo
+    contra o resultado do JS, motorista por motorista e zona por zona,
+    incluindo as duas zonas reais já cadastradas — círculo e polígono):
+    resultado idêntico em todos os casos.
+- **Para ligar de verdade** (quando o volume justificar): trocar o corpo de
+  `findNearestAvailableDriver` para chamar `nearestDriverPostgis` (mesmos
+  parâmetros: origem, excluídos, só-estes, raio preferencial/máximo, forma de
+  pagamento) e o trecho de `findApplicableZone` que testa a geometria para
+  filtrar por `zonesContainingPoint` — reescrevendo os testes que hoje mockam
+  `prisma.driver.findMany`/`isPointInPolygon` para mockar `$queryRaw`.
+- **Requisito de ambiente**: `CREATE EXTENSION postgis` exige superusuário do
+  Postgres. Em Docker (`docker-compose.yml`, imagem `postgis/postgis`) a
+  migration cria sozinha, porque o usuário do banco já é superusuário do
+  container. Fora do Docker (Postgres.app local, RDS, Supabase etc.), alguém
+  com mais acesso roda `CREATE EXTENSION IF NOT EXISTS postgis;` uma vez antes
+  de `npx prisma migrate deploy` — sem isso a migration falha com "permission
+  denied to create extension" (não com o usuário normal da aplicação).
+
 ## 6. Riscos técnicos identificados
 
 - **Tempo real (Fase 3):** localização de motoristas e status de corrida
   exigem WebSockets ou polling curto. NestJS tem gateway de WebSocket
   nativo (`@nestjs/websockets`); Redis entra aí como pub/sub entre
   instâncias da API quando houver mais de um processo rodando.
-- **Geoprocessamento de zonas:** checar se um ponto está dentro de um
-  polígono é barato em memória para dezenas de zonas, mas não escala
-  indefinidamente via query SQL simples. Se o número de zonas crescer muito,
-  vale considerar PostGIS — não necessário na Fase 1-4.
+- **(Superado — ver 5-K: PostGIS já está disponível e testado.)**
+  Geoprocessamento de zonas: checar se um ponto está dentro de um polígono
+  era barato em memória para dezenas de zonas, mas não escalava
+  indefinidamente via query SQL simples.
 - **Consistência de preço:** o preço final de uma corrida precisa ser
   congelado no momento do cálculo (`Ride.pricingBreakdown`), não
   recalculado depois — senão uma mudança de tarifa altera corridas
