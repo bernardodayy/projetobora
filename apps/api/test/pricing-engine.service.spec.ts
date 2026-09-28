@@ -1,4 +1,12 @@
 import { PricingEngineService } from '../src/pricing/pricing-engine.service';
+import { zonesContainingPoint } from '../src/common/postgis';
+
+// Este arquivo testa a combinação de multiplicadores (HIGHEST_MULTIPLIER, MULTIPLY_ALL etc.), não geometria
+// — "o ponto está dentro desta forma?" já é testado a fundo em postgis.spec.ts (unitário) e ao vivo contra
+// zonas reais (ver ARQUITETURA.md 5-K). Por padrão a zona candidata "contém" o ponto (mesmo comportamento
+// que as fixtures tinham antes, com ORIGIN sempre dentro de ZONE); só o último teste simula "fora".
+jest.mock('../src/common/postgis');
+const mockZonesContaining = zonesContainingPoint as jest.Mock;
 
 const CONFIG = {
   id: 'config-1',
@@ -59,6 +67,10 @@ const DESTINATION = { lat: -23.56, lng: -46.64 };
 const NOW = new Date();
 
 describe('PricingEngineService.calculate', () => {
+  beforeEach(() => {
+    mockZonesContaining.mockReset().mockImplementation(async (_prisma: unknown, zoneIds: string[]) => zoneIds);
+  });
+
   it('applies the higher of the two multipliers under HIGHEST_MULTIPLIER', async () => {
     const engine = makeEngine();
     const result = await engine.calculate(ORIGIN, DESTINATION, NOW);
@@ -99,8 +111,8 @@ describe('PricingEngineService.calculate', () => {
   });
 
   it('ignores a zone whose geometry does not contain the origin point', async () => {
-    const farZone = { ...ZONE, geometry: { center: { lat: 10, lng: 10 }, radiusMeters: 100 } };
-    const engine = makeEngine({ zones: [farZone] });
+    mockZonesContaining.mockResolvedValue([]); // PostGIS não achou nenhuma zona candidata contendo o ponto
+    const engine = makeEngine();
     const result = await engine.calculate(ORIGIN, DESTINATION, NOW);
     expect(result.zone).toBeNull();
   });

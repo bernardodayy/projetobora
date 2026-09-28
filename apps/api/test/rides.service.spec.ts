@@ -1,6 +1,14 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { RidesService } from '../src/rides/rides.service';
+import { nearestDriverPostgis } from '../src/common/postgis';
+
+// O casamento espacial (motorista mais próximo) mora em common/postgis.ts (ver postgis.spec.ts para os
+// critérios de elegibilidade em si — sinal de vida, forma de pagamento etc.); aqui só interessa que
+// RidesService chama essa busca com as opções certas (raio, exclusões, forma de pagamento) e usa o
+// resultado corretamente — não como o SQL é montado.
+jest.mock('../src/common/postgis');
+const mockNearestDriver = nearestDriverPostgis as jest.Mock;
 
 function makeService(ride: any, driver: any = { status: 'APPROVED' }) {
   const prisma = {
@@ -36,7 +44,6 @@ function makeDispatchService(ride: any) {
     },
     driver: {
       findFirst: jest.fn().mockResolvedValue({ status: 'APPROVED' }),
-      findMany: jest.fn().mockResolvedValue([]),
       update: jest.fn().mockImplementation(({ where, data }: any) => ({ id: where.id, ...data })),
     },
     customer: {
@@ -132,13 +139,14 @@ describe('RidesService status transitions', () => {
 });
 
 describe('RidesService automatic dispatch', () => {
+  beforeEach(() => {
+    mockNearestDriver.mockReset().mockResolvedValue(null); // sem motorista, por padrão — cada teste liga o que precisa
+  });
+
   it('auto-assigns the nearest available driver on ride creation', async () => {
     const created = { id: 'ride-1', status: 'REQUESTED' };
     const { service, prisma } = makeDispatchService(created);
-    prisma.driver.findMany.mockResolvedValue([
-      { id: 'far', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 1, lastLng: 0 },
-      { id: 'near', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.01, lastLng: 0 },
-    ]);
+    mockNearestDriver.mockResolvedValue({ id: 'near', distanceKm: 1.1 });
 
     const dto = {
       customerId: 'c1',
@@ -158,16 +166,7 @@ describe('RidesService automatic dispatch', () => {
   it('offers the ride to an available favorite driver before the nearest one', async () => {
     const created = { id: 'ride-1', status: 'REQUESTED' };
     const { service, prisma } = makeDispatchService(created);
-    const allDrivers = [
-      { id: 'near', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.01, lastLng: 0 },
-      { id: 'favorite-far', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.1, lastLng: 0 },
-    ];
-    prisma.driver.findMany.mockImplementation(({ where }: any) => {
-      let result = allDrivers;
-      if (where.id?.in) result = result.filter((d) => where.id.in.includes(d.id));
-      if (where.id?.notIn) result = result.filter((d) => !where.id.notIn.includes(d.id));
-      return Promise.resolve(result);
-    });
+    mockNearestDriver.mockResolvedValueOnce({ id: 'favorite-far', distanceKm: 11 }); // 1ª chamada: só entre os favoritos
     prisma.customerFavoriteDriver.findMany.mockResolvedValue([{ driverId: 'favorite-far' }]);
 
     const dto = {
@@ -181,13 +180,15 @@ describe('RidesService automatic dispatch', () => {
     } as any;
     await service.create(dto, 'admin-1');
 
+    expect(mockNearestDriver).toHaveBeenCalledTimes(1); // achou favorito, nem chegou a buscar geral
+    expect(mockNearestDriver.mock.calls[0][2].onlyDriverIds).toEqual(['favorite-far']);
     const busyUpdate = prisma.driver.update.mock.calls.find((call: any) => call[0].data.availability === 'BUSY');
     expect(busyUpdate[0].where.id).toBe('favorite-far');
   });
 
   it('gives an automatic offer a deadline (tempoOfertaSegundos) so it can expire', async () => {
     const { service, prisma } = makeDispatchService({ id: 'ride-1', status: 'REQUESTED' });
-    prisma.driver.findMany.mockResolvedValue([{ id: 'near', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.01, lastLng: 0 }]);
+    mockNearestDriver.mockResolvedValue({ id: 'near', distanceKm: 1.1 });
 
     await service.create({ customerId: 'c1', originAddress: 'Origem 12345', originLat: 0, originLng: 0, destinationAddress: 'Destino 12345', destinationLat: 0, destinationLng: 0 } as any, 'admin-1');
 
@@ -235,7 +236,7 @@ describe('RidesService automatic dispatch', () => {
 
     it('retries a ride with no driver and assigns one that came online meanwhile', async () => {
       const { service, prisma } = setup(searching());
-      prisma.driver.findMany.mockResolvedValue([{ id: 'late', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.01, lastLng: 0 }]);
+      mockNearestDriver.mockResolvedValue({ id: 'late', distanceKm: 2 });
 
       await service.processSearchingRides();
 
@@ -259,7 +260,7 @@ describe('RidesService automatic dispatch', () => {
       const { service, prisma } = setup(searching());
       prisma.rideEvent.findMany.mockResolvedValue([{ metadata: { driverId: 'a' } }, { metadata: { driverId: 'b' } }, { metadata: { driverId: 'c' } }]);
       await service.processSearchingRides();
-      expect(prisma.driver.findMany).not.toHaveBeenCalled();
+      expect(mockNearestDriver).not.toHaveBeenCalled();
     });
 
     it('cancels the ride when nobody accepted within the maximum search time and frees its coupon', async () => {
@@ -269,7 +270,7 @@ describe('RidesService automatic dispatch', () => {
       const cancelled = prisma.ride.update.mock.calls.find((call: any) => call[0].data.status === 'CANCELLED')[0];
       expect(cancelled.data.cancelReason).toContain('Nenhum motorista disponível');
       expect(coupons.release).toHaveBeenCalledWith('ride-1');
-      expect(prisma.driver.findMany).not.toHaveBeenCalled();
+      expect(mockNearestDriver).not.toHaveBeenCalled();
     });
 
     it('counts the search time from the scheduled time, not from when it was requested', async () => {
@@ -287,7 +288,7 @@ describe('RidesService automatic dispatch', () => {
 
   it('gives the driver back when the ride was cancelled while the driver was being picked', async () => {
     const { service, prisma } = makeDispatchService({ id: 'ride-1', status: 'REQUESTED' });
-    prisma.driver.findMany.mockResolvedValue([{ id: 'near', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.01, lastLng: 0 }]);
+    mockNearestDriver.mockResolvedValue({ id: 'near', distanceKm: 1.1 });
     prisma.ride.update.mockRejectedValue(new Prisma.PrismaClientKnownRequestError('changed', { code: 'P2025', clientVersion: 't' }));
 
     await expect((service as any).tryAutoAssign('ride-1', 'c1', { lat: 0, lng: 0 })).rejects.toThrow(ConflictException);
@@ -302,42 +303,22 @@ describe('RidesService automatic dispatch', () => {
 
     await service.redispatch('ride-1', 'admin-1');
 
-    const findManyArgs = prisma.driver.findMany.mock.calls[0][0];
-    expect(findManyArgs.where.id.notIn).toContain('driver-A');
+    expect(mockNearestDriver.mock.calls[0][2].excludeDriverIds).toContain('driver-A');
   });
 
-  it('only offers rides to drivers with a recent sign of life', async () => {
-    const { service, prisma } = makeDispatchService({ id: 'ride-1', status: 'REQUESTED' });
-    await service.create({ customerId: 'c1', originAddress: 'Origem 12345', originLat: 0, originLng: 0, destinationAddress: 'Destino 12345', destinationLat: 0, destinationLng: 0 } as any, 'admin-1');
-
-    const { lastSeenAt } = prisma.driver.findMany.mock.calls[0][0].where;
-    expect(lastSeenAt.gte).toBeInstanceOf(Date);
-    expect(Date.now() - lastSeenAt.gte.getTime()).toBeLessThan(3 * 60_000 + 5_000);
-  });
-
-  it.each([
-    ['CREDIT_CARD', { hasCardMachine: true }],
-    ['DEBIT_CARD', { hasCardMachine: true }],
-    ['PIX', { pixKey: { not: null } }],
-  ])('a %s ride is only offered to drivers who can receive it', async (paymentMethod, expected) => {
-    const { service, prisma } = makeDispatchService({ id: 'ride-1', status: 'REQUESTED' });
+  // Os critérios de elegibilidade (sinal de vida, forma de pagamento → SQL) são de common/postgis.ts —
+  // ver postgis.spec.ts. Aqui só interessa que RidesService passa a forma de pagamento certa adiante.
+  it.each(['CREDIT_CARD', 'DEBIT_CARD', 'PIX', 'CASH'])('passes the ride\'s payment method through to the driver search (%s)', async (paymentMethod) => {
+    const { service } = makeDispatchService({ id: 'ride-1', status: 'REQUESTED' });
     await service.create({ customerId: 'c1', originAddress: 'Origem 12345', originLat: 0, originLng: 0, destinationAddress: 'Destino 12345', destinationLat: 0, destinationLng: 0, paymentMethod } as any, 'admin-1');
-    expect(prisma.driver.findMany.mock.calls[0][0].where).toMatchObject(expected);
-  });
-
-  it('a cash ride is offered to any available driver', async () => {
-    const { service, prisma } = makeDispatchService({ id: 'ride-1', status: 'REQUESTED' });
-    await service.create({ customerId: 'c1', originAddress: 'Origem 12345', originLat: 0, originLng: 0, destinationAddress: 'Destino 12345', destinationLat: 0, destinationLng: 0, paymentMethod: 'CASH' } as any, 'admin-1');
-    const where = prisma.driver.findMany.mock.calls[0][0].where;
-    expect(where).not.toHaveProperty('hasCardMachine');
-    expect(where).not.toHaveProperty('pixKey');
+    expect(mockNearestDriver.mock.calls[0][2].paymentMethod).toBe(paymentMethod);
   });
 
   it('keeps the payment requirement when the ride is redispatched or retried later', async () => {
     const before = { id: 'ride-1', status: 'DRIVER_ASSIGNED', driverId: 'driver-A', customerId: 'c1', originLat: 0, originLng: 0, originAddress: 'A', destinationAddress: 'B', paymentMethod: 'CREDIT_CARD' };
     const { service, prisma } = makeDispatchService(before);
     await service.redispatch('ride-1', 'admin-1');
-    expect(prisma.driver.findMany.mock.calls[0][0].where).toMatchObject({ hasCardMachine: true });
+    expect(mockNearestDriver.mock.calls[0][2].paymentMethod).toBe('CREDIT_CARD');
   });
 
   it('excludes drivers the customer has blocked from auto-assignment', async () => {
@@ -356,8 +337,7 @@ describe('RidesService automatic dispatch', () => {
     } as any;
     await service.create(dto, 'admin-1');
 
-    const findManyArgs = prisma.driver.findMany.mock.calls[0][0];
-    expect(findManyArgs.where.id.notIn).toContain('driver-blocked');
+    expect(mockNearestDriver.mock.calls[0][2].excludeDriverIds).toContain('driver-blocked');
   });
 
   it('excludes drivers who have blocked the customer from auto-assignment', async () => {
@@ -376,8 +356,7 @@ describe('RidesService automatic dispatch', () => {
     } as any;
     await service.create(dto, 'admin-1');
 
-    const findManyArgs = prisma.driver.findMany.mock.calls[0][0];
-    expect(findManyArgs.where.id.notIn).toContain('driver-who-blocked-me');
+    expect(mockNearestDriver.mock.calls[0][2].excludeDriverIds).toContain('driver-who-blocked-me');
   });
 
   it('sends the ride back to the queue (no error) once the attempt limit is reached, so the driver can still decline', async () => {
@@ -387,7 +366,7 @@ describe('RidesService automatic dispatch', () => {
 
     await expect(service.redispatch('ride-1', 'admin-1')).resolves.toBeDefined();
 
-    expect(prisma.driver.findMany).not.toHaveBeenCalled(); // não procurou outro motorista
+    expect(mockNearestDriver).not.toHaveBeenCalled(); // não procurou outro motorista
     expect(prisma.ride.update).toHaveBeenCalledWith(expect.objectContaining({ data: { driverId: null, status: 'SEARCHING_DRIVER', offerExpiresAt: null } }));
     expect(notifications.create).toHaveBeenCalledWith(expect.objectContaining({ title: 'Despacho automático não encontrou motorista' }));
   });
@@ -404,7 +383,7 @@ describe('RidesService automatic dispatch', () => {
 
     await service.redispatch('ride-1', undefined, 'longe demais');
 
-    expect(prisma.driver.findMany).toHaveBeenCalled();
+    expect(mockNearestDriver).toHaveBeenCalled();
   });
 
   it('turns a concurrent status change into a conflict instead of applying it twice', async () => {
@@ -419,11 +398,11 @@ describe('RidesService automatic dispatch', () => {
   it('skips a driver another ride claimed first and offers the next nearest one', async () => {
     const created = { id: 'ride-1', status: 'REQUESTED' };
     const { service, prisma } = makeDispatchService(created);
-    const all = [
-      { id: 'near', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.01, lastLng: 0 },
-      { id: 'far', status: 'APPROVED', availability: 'AVAILABLE', lastLat: 0.02, lastLng: 0 },
+    const pool = [
+      { id: 'near', distanceKm: 1 },
+      { id: 'far', distanceKm: 2 },
     ];
-    prisma.driver.findMany.mockImplementation(({ where }: any) => all.filter((d) => !where.id.notIn.includes(d.id)));
+    mockNearestDriver.mockImplementation(async (_prisma: any, _origin: any, options: any) => pool.find((d) => !options.excludeDriverIds.includes(d.id)) ?? null);
     prisma.driver.update.mockImplementation(({ where, data }: any) => {
       if (where.id === 'near') throw new Prisma.PrismaClientKnownRequestError('taken', { code: 'P2025', clientVersion: 'x' });
       return { id: where.id, ...data };
@@ -433,6 +412,7 @@ describe('RidesService automatic dispatch', () => {
 
     const assigned = prisma.ride.update.mock.calls.find((call: any) => call[0].data.status === 'DRIVER_ASSIGNED');
     expect(assigned[0].data.driverId).toBe('far');
+    expect(mockNearestDriver).toHaveBeenCalledTimes(2); // 1ª achou 'near' (levado por outra corrida), 2ª achou 'far'
   });
 
   it('rejects a second immediate ride for a customer who already has one active', async () => {
@@ -500,7 +480,7 @@ describe('RidesService automatic dispatch', () => {
     } as any;
 
     await expect(service.create(dto, 'admin-1')).rejects.toThrow(BadRequestException);
-    expect(prisma.driver.findMany).not.toHaveBeenCalled();
+    expect(mockNearestDriver).not.toHaveBeenCalled();
   });
 
   it('does not auto-dispatch a ride scheduled far in the future', async () => {
@@ -520,7 +500,7 @@ describe('RidesService automatic dispatch', () => {
 
     await service.create(dto, 'admin-1');
 
-    expect(prisma.driver.findMany).not.toHaveBeenCalled();
+    expect(mockNearestDriver).not.toHaveBeenCalled();
   });
 });
 

@@ -9,11 +9,10 @@ import { FinanceiroService } from '../financeiro/financeiro.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { SettingsService } from '../settings/settings.service';
 import { CouponsService } from '../coupons/coupons.service';
-import { haversineDistanceKm, round2 } from '../pricing/geometry.util';
+import { round2 } from '../pricing/geometry.util';
+import { nearestDriverPostgis } from '../common/postgis';
 import { rangeBound } from '../common/timezone';
 import { Page } from '../common/pagination';
-import { presenceCutoff } from '../common/presence';
-import { driverReceivesFilter } from '../common/payment';
 import { CreateRideDto } from './dto/create-ride.dto';
 import { QuoteRideDto } from './dto/quote-ride.dto';
 import { AssignDriverDto } from './dto/assign-driver.dto';
@@ -232,31 +231,18 @@ export class RidesService {
   // respeitando o raio preferencial e, na falta de alguém dentro dele, a distância máxima
   // configurados em Configurações → Despacho. `onlyDriverIds`, quando passado, restringe a
   // busca a esse conjunto (usado para priorizar favoritos sem duplicar a lógica de ranking).
+  // Consulta espacial indexada (PostGIS, ver common/postgis.ts) — critérios de elegibilidade
+  // (aprovado, disponível, sinal de vida recente, capaz de receber a forma de pagamento) e a
+  // preferência pelo raio menor vivem lá agora, não mais aqui.
   private async findNearestAvailableDriver(origin: { lat: number; lng: number }, excludeDriverIds: string[], onlyDriverIds?: string[], paymentMethod?: string | null) {
-    if (onlyDriverIds && onlyDriverIds.length === 0) return null;
     const despacho = await this.settings.getSection('despacho');
-    const candidates = await this.prisma.driver.findMany({
-      where: {
-        status: 'APPROVED',
-        availability: 'AVAILABLE',
-        deletedAt: null,
-        lastLat: { not: null },
-        lastLng: { not: null },
-        // Só quem deu sinal de vida recentemente: app fechado/sem internet não recebe oferta.
-        lastSeenAt: { gte: presenceCutoff() },
-        // Corrida no cartão só vai a quem tem máquina; no Pix, a quem cadastrou a chave.
-        ...driverReceivesFilter(paymentMethod),
-        id: onlyDriverIds ? { in: onlyDriverIds, notIn: excludeDriverIds } : { notIn: excludeDriverIds },
-      },
+    return nearestDriverPostgis(this.prisma, origin, {
+      excludeDriverIds,
+      onlyDriverIds,
+      maxKm: despacho.distanciaMaximaKm,
+      preferredKm: despacho.raioProcuraKm,
+      paymentMethod,
     });
-
-    const ranked = candidates
-      .map((driver) => ({ driver, distanceKm: haversineDistanceKm(origin, { lat: Number(driver.lastLat), lng: Number(driver.lastLng) }) }))
-      .filter((c) => c.distanceKm <= despacho.distanciaMaximaKm)
-      .sort((a, b) => a.distanceKm - b.distanceKm);
-
-    const withinPreferredRadius = ranked.filter((c) => c.distanceKm <= despacho.raioProcuraKm);
-    return withinPreferredRadius[0] ?? ranked[0] ?? null;
   }
 
   // Pega o motorista de vez (AVAILABLE → BUSY numa instrução só): dois pedidos
@@ -282,9 +268,9 @@ export class RidesService {
       const nearest = nearestFavorite ?? (await this.findNearestAvailableDriver(origin, excluded, undefined, paymentMethod));
       if (!nearest) return null;
 
-      const driver = await this.claimDriver(nearest.driver.id);
+      const driver = await this.claimDriver(nearest.id);
       if (!driver) {
-        excluded.push(nearest.driver.id); // outra corrida levou esse motorista primeiro
+        excluded.push(nearest.id); // outra corrida levou esse motorista primeiro
         continue;
       }
       this.realtime.broadcastDriverUpdated(driver);

@@ -1,7 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DistanceService } from './distance.service';
-import { isPointInCircle, isPointInPolygon, round2, type LatLng } from './geometry.util';
+import { round2, type LatLng } from './geometry.util';
+import { zonesContainingPoint } from '../common/postgis';
 import { matchesDateRange, matchesDayAndTime } from './time-window.util';
 
 export interface PricingBreakdown {
@@ -26,20 +27,22 @@ export class PricingEngineService {
     private readonly distance: DistanceService,
   ) {}
 
+  // Dia/horário/data continuam em JS (não é espacial, e cada zona tem sua própria janela — nada que uma
+  // consulta geoespacial resolva). Só o teste "o ponto está dentro desta geometria?" vai para o PostGIS
+  // (ST_Contains, ver common/postgis.ts) — é o que ele faz bem, e substitui o ray casting/haversine feitos
+  // em JS antes. A primeira zona (já em ordem de prioridade) cujo id aparece na resposta do PostGIS vence,
+  // mesmo critério de "primeiro match" de antes.
   async findApplicableZone(point: LatLng, at: Date) {
     const zones = await this.prisma.pricingZone.findMany({ where: { isActive: true }, orderBy: { priority: 'desc' } });
-    for (const zone of zones) {
-      if (!matchesDateRange({ startDate: zone.startDate, endDate: zone.endDate }, at)) continue;
-      if (!matchesDayAndTime({ daysOfWeek: zone.daysOfWeek, startTime: zone.startTime, endTime: zone.endTime }, at)) continue;
+    const active = zones.filter(
+      (zone) =>
+        matchesDateRange({ startDate: zone.startDate, endDate: zone.endDate }, at) &&
+        matchesDayAndTime({ daysOfWeek: zone.daysOfWeek, startTime: zone.startTime, endTime: zone.endTime }, at),
+    );
+    if (active.length === 0) return null;
 
-      const geometry = zone.geometry as any;
-      const inside =
-        zone.shape === 'CIRCLE'
-          ? isPointInCircle(point, geometry.center, geometry.radiusMeters)
-          : isPointInPolygon(point, geometry.points);
-      if (inside) return zone;
-    }
-    return null;
+    const containing = new Set(await zonesContainingPoint(this.prisma, active.map((zone) => zone.id), point));
+    return active.find((zone) => containing.has(zone.id)) ?? null;
   }
 
   async findApplicableSchedule(at: Date) {

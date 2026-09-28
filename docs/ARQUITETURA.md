@@ -833,7 +833,7 @@ vivo. Bugs encontrados e corrigidos — o porquê de cada regra abaixo:
   aberto e online), sem GPS com a tela apagada (o app mantém a tela ligada
   enquanto online), carteira/cartão/pagamento sem gateway real.
 
-## 5-K. PostGIS (preparado, não ligado no despacho/precificação de verdade)
+## 5-K. PostGIS — ligado no despacho e na precificação
 
 - **O quê**: a extensão PostGIS está habilitada no banco (migration
   `enable_postgis`) e duas colunas geoespaciais indexadas (GiST) existem e são
@@ -841,45 +841,50 @@ vivo. Bugs encontrados e corrigidos — o porquê de cada regra abaixo:
   (`geography(Point,4326)`, espelha `lastLat`/`lastLng`) e
   `PricingZone.geom` (`geometry(Geometry,4326)`, espelha `geometry`/`shape` —
   círculo vira polígono via `ST_Buffer`). Como os triggers disparam em
-  `BEFORE INSERT OR UPDATE` dessas colunas, **nenhum código da aplicação foi
-  tocado**: heartbeat, atualização de GPS pelo app, correção manual pelo
-  admin, cadastro/edição de zona — tudo continua gravando exatamente como
-  antes e o `geom` se atualiza sozinho. No `schema.prisma` os campos são
-  `Unsupported(...)`, então o Prisma Client nem inclui `geom` nas consultas
-  normais (`findMany`, `select` sem pedir explicitamente) — só dá pra ler via
-  `$queryRaw`, e só quem for buscar de propósito é afetado.
-- **Por que não está ligado no despacho/precificação por padrão**: o casamento
-  em memória (`RidesService.findNearestAvailableDriver`, haversine) e o
-  point-in-polygon em JS (`PricingEngineService.findApplicableZone`) já são
-  testados extensivamente (200+ casos) e funcionam bem no volume atual — a
-  seção 6 já dizia que isso "não é necessário na Fase 1-4". Trocar o caminho
-  ativo do despacho exigiria reescrever essa bateria de testes (eles mockam
-  `prisma.driver.findMany` diretamente) por pouco ganho agora. Em vez disso,
-  ficou pronto e testado, para trocar quando o volume justificar.
-- **`apps/api/src/common/postgis.ts`** tem as duas consultas prontas,
-  equivalentes ponto a ponto ao que roda hoje (mesmos critérios: aprovado,
+  `BEFORE INSERT OR UPDATE` dessas colunas, **nenhum código de escrita mudou**:
+  heartbeat, atualização de GPS pelo app, correção manual pelo admin,
+  cadastro/edição de zona — tudo grava exatamente como antes e o `geom` se
+  atualiza sozinho. No `schema.prisma` os campos são `Unsupported(...)`, então
+  o Prisma Client nem inclui `geom` nas consultas normais — só dá pra ler via
+  `$queryRaw`.
+- **`apps/api/src/common/postgis.ts`** tem as duas consultas que agora rodam
+  de verdade no despacho e na precificação (mesmos critérios de antes: aprovado,
   disponível, sinal de vida recente — `presenceCutoff()` —, capaz de receber a
   forma de pagamento — mesma regra de `common/payment.ts`, duplicada em SQL de
   propósito —, prefere o raio preferencial e só cai pro raio máximo se
   ninguém estiver dentro dele):
-  - `nearestDriverPostgis(prisma, origin, options)` — substituiria
+  - `nearestDriverPostgis(prisma, origin, options)` — usada por
     `RidesService.findNearestAvailableDriver`: uma consulta indexada
     (`ST_DWithin` + operador KNN `<->`) no lugar de trazer todo mundo pra
-    memória e calcular haversine em JS.
-  - `zonesContainingPoint(prisma, zoneIds, point)` — substituiria o
-    `isPointInPolygon`/`isPointInCircle` dentro de `findApplicableZone`
-    (`ST_Contains`), recebendo só os ids já filtrados por data/dia/horário
-    (isso continua em JS, não é espacial).
-  - Testado com dados reais (`test/postgis.spec.ts` + comparação ao vivo
-    contra o resultado do JS, motorista por motorista e zona por zona,
-    incluindo as duas zonas reais já cadastradas — círculo e polígono):
-    resultado idêntico em todos os casos.
-- **Para ligar de verdade** (quando o volume justificar): trocar o corpo de
-  `findNearestAvailableDriver` para chamar `nearestDriverPostgis` (mesmos
-  parâmetros: origem, excluídos, só-estes, raio preferencial/máximo, forma de
-  pagamento) e o trecho de `findApplicableZone` que testa a geometria para
-  filtrar por `zonesContainingPoint` — reescrevendo os testes que hoje mockam
-  `prisma.driver.findMany`/`isPointInPolygon` para mockar `$queryRaw`.
+    memória e calcular haversine em JS. `findNearestAvailableDriver` hoje só
+    lê `distanciaMaximaKm`/`raioProcuraKm` de Configurações → Despacho e
+    delega a consulta.
+  - `zonesContainingPoint(prisma, zoneIds, point)` — usada por
+    `PricingEngineService.findApplicableZone`: o filtro por data/dia da
+    semana/horário de cada zona continua em JS (não é espacial), e só o teste
+    "o ponto está dentro desta geometria?" vai para `ST_Contains`, recebendo
+    só os ids que já passaram no filtro temporal, em ordem de prioridade —
+    a primeira cujo id aparece na resposta do PostGIS vence, mesmo critério
+    de "primeira zona que bate" de antes.
+- **Testes**: a correção geométrica/de matching em si (`ST_DWithin`, KNN,
+  `ST_Contains`, presença, forma de pagamento) é coberta em
+  `test/postgis.spec.ts`, unitária. `test/rides.service.spec.ts` e
+  `test/pricing-engine.service.spec.ts` mockam o módulo inteiro
+  (`jest.mock('../src/common/postgis')`) e testam só a integração — que
+  `RidesService`/`PricingEngineService` chamam essas funções com as opções
+  certas (raio, exclusões, forma de pagamento, prioridade das zonas) e usam o
+  resultado corretamente — sem duplicar a lógica de SQL num mock de
+  `prisma.driver.findMany`.
+- **Verificado ao vivo** contra o banco real, com o despacho e a precificação
+  já trocados: ponto no centro/dentro das duas zonas reais cadastradas (círculo
+  e polígono) aplicou a zona e o multiplicador certos via `/pricing/simulate`,
+  ponto fora não aplicou nenhuma; motorista mais próximo venceu o despacho;
+  corrida no cartão/Pix pulou o motorista mais próximo (sem máquina/chave) e
+  foi para quem podia receber; motorista sem sinal de vida recente foi
+  excluído mesmo sendo o mais próximo; motorista bloqueado pelo cliente foi
+  excluído; recusar passou a corrida para o próximo; e a fila de retentativa
+  (`dispatchTick`, a cada 3 s) pegou um motorista que ficou online depois da
+  corrida já estar "procurando".
 - **Requisito de ambiente**: `CREATE EXTENSION postgis` exige superusuário do
   Postgres. Em Docker (`docker-compose.yml`, imagem `postgis/postgis`) a
   migration cria sozinha, porque o usuário do banco já é superusuário do

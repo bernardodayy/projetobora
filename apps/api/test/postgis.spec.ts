@@ -33,6 +33,17 @@ describe('nearestDriverPostgis', () => {
     expect(values).toEqual(expect.arrayContaining([origin.lng, origin.lat, 30_000, 'a', 'b']));
   });
 
+  it('only considers drivers with a sign of life inside the presence window', async () => {
+    const prisma = { $queryRaw: jest.fn().mockResolvedValue([]) } as any;
+    await nearestDriverPostgis(prisma, origin, baseOptions);
+    const sql = prisma.$queryRaw.mock.calls[0][0].sql;
+    expect(sql).toContain('"lastSeenAt" >=');
+    const values = valuesOf(prisma.$queryRaw.mock.calls[0]);
+    const cutoff = values.find((v: unknown) => v instanceof Date) as Date | undefined;
+    expect(cutoff).toBeInstanceOf(Date);
+    expect(Date.now() - cutoff!.getTime()).toBeLessThan(3 * 60_000 + 5_000); // PRESENCE_TIMEOUT_MS (common/presence.ts) + folga
+  });
+
   it('only restricts by card machine on a card ride, and only by Pix key on a Pix ride', async () => {
     const prisma = { $queryRaw: jest.fn().mockResolvedValue([]) } as any;
     for (const method of ['CREDIT_CARD', 'DEBIT_CARD']) {
